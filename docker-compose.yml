@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: my-personal-tech-radar-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: my_personal_tech_radar
+      POSTGRES_USER: techradar
+      POSTGRES_PASSWORD: techradar_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

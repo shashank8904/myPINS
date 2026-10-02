@@ -1,0 +1,19 @@
+# Environment files (contain secrets)
+.env
+
+# Compiled Go binaries
+api
+worker
+ingest
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# AI session data
+.ai/
