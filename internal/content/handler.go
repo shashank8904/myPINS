@@ -1,21 +1,36 @@
 package content
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
 )
 
+// ContentGetter is the subset of Service used by the Get handler.
+// Introduced to allow handler unit testing without a live database.
+type ContentGetter interface {
+	GetByID(ctx context.Context, id int64) (ContentItem, error)
+}
+
+// Handler provides HTTP handlers for content items and feed interactions.
+// It holds a reference to the Service, which coordinates between the HTTP
+// layer and the Repository.
 type Handler struct {
 	service *Service
+	getter  ContentGetter
 }
 
 func NewHandler(service *Service) *Handler {
-	return &Handler{service: service}
+	return &Handler{
+		service: service,
+		getter:  service,
+	}
 }
 
-// List returns the feed of content items.
+// List returns the personalized feed of content items.
 // GET /api/feed
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	items, err := h.service.List(r.Context())
@@ -32,8 +47,14 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Get returns a single content item.
+// Get returns a single content item by ID.
 // GET /api/items/{id}
+//
+// Status codes:
+//   - 200: item found and returned
+//   - 400: the {id} path value is not a valid integer
+//   - 404: no item exists with that ID
+//   - 500: database or encoding error
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id") // requires Go 1.22+
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -42,11 +63,14 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := h.service.GetByID(r.Context(), id)
+	item, err := h.getter.GetByID(r.Context(), id)
 	if err != nil {
+		if errors.Is(err, errItemNotFound) {
+			http.Error(w, "Item not found", http.StatusNotFound)
+			return
+		}
 		log.Printf("Failed to get item %d: %v", id, err)
-		// Usually we'd check for a Not Found error specifically, but for V0 this is ok
-		http.Error(w, "Item not found or server error", http.StatusInternalServerError)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 

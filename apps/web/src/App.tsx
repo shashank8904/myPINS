@@ -1,5 +1,15 @@
 import { useEffect, useState } from 'react';
 
+// stripHtml removes all HTML tags from a string and returns plain text.
+// RSS feed descriptions frequently contain HTML. We do not trust that content
+// and rendering it via dangerouslySetInnerHTML creates an XSS vector.
+// DOMParser is available in all modern browsers and performs the same parsing
+// the browser would do, but we only extract textContent — never innerHTML.
+function stripHtml(html: string): string {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  return doc.body.textContent ?? '';
+}
+
 // Mirrors ContentItem from the Go backend
 interface ContentItem {
   ID: number;
@@ -151,10 +161,9 @@ function App() {
                   )}
                   
                   {item.Summary && (
-                    <div 
-                      className="feed-item-summary"
-                      dangerouslySetInnerHTML={{ __html: item.Summary }}
-                    />
+                    <div className="feed-item-summary">
+                      {stripHtml(item.Summary)}
+                    </div>
                   )}
 
                   {item.WhyItMatters && (

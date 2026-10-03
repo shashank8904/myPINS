@@ -3,11 +3,19 @@ package content
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// errItemNotFound is the sentinel error returned by GetByID when no row exists
+// for the requested ID. Callers use errors.Is(err, errItemNotFound) to
+// distinguish a missing resource (404) from a real database failure (500).
+// It is unexported because it is an implementation detail of this package;
+// only the handler layer needs to distinguish these two cases.
+var errItemNotFound = fmt.Errorf("content item not found")
 
 // Repository handles persistence for ContentItem records.
 // It talks to PostgreSQL directly via a pgx connection, following the same
@@ -160,6 +168,8 @@ func (r *Repository) CreateOrIgnore(ctx context.Context, item ContentItem) (Cont
 }
 
 // GetByID retrieves a single ContentItem by its primary key.
+// Returns errItemNotFound (check with errors.Is) when no row exists for the
+// given ID. All other errors represent database or scanning failures.
 func (r *Repository) GetByID(ctx context.Context, id int64) (ContentItem, error) {
 	query := `
 		SELECT` + columnList + `
@@ -170,6 +180,9 @@ func (r *Repository) GetByID(ctx context.Context, id int64) (ContentItem, error)
 	var item ContentItem
 	row := r.db.QueryRow(ctx, query, id)
 	if err := scanItem(row, &item); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ContentItem{}, errItemNotFound
+		}
 		return ContentItem{}, err
 	}
 	return item, nil
@@ -207,50 +220,59 @@ func (r *Repository) List(ctx context.Context) ([]ContentItem, error) {
 }
 
 // ListPersonalized returns a ranked feed based on user interests, roadmap, and time decay.
-// It also returns an explanation for why the item was ranked highly.
+// It extracts the raw ranking signals from the database and delegates the actual
+// ranking mathematics and sorting to the Go ranking package.
 func (r *Repository) ListPersonalized(ctx context.Context, limit int) ([]ContentItem, error) {
+	// We fetch up to 1000 unread items to score in memory.
+	// This is perfectly safe for a personal V0 and makes the ranking highly testable.
 	query := `
-		WITH scored_items AS (
+		WITH topic_feedback AS (
 			SELECT 
-				ci.id,
-				MAX(COALESCE(s.base_quality_score, 0.5)) AS base_quality,
-				MAX(COALESCE(i.weight * cit.relevance_score, 0)) AS max_interest,
-				MAX(CASE WHEN ro.status = 'current' THEN 3.0 WHEN ro.status = 'next' THEN 2.0 ELSE 0.0 END) AS max_roadmap
-			FROM content_items ci
-			JOIN sources s ON ci.source_id = s.id
-			LEFT JOIN content_item_topics cit ON ci.id = cit.content_item_id
-			LEFT JOIN interests i ON cit.topic_id = i.topic_id
-			LEFT JOIN roadmap_items ro ON cit.topic_id = ro.topic_id
-			LEFT JOIN user_item_interactions uii ON ci.id = uii.content_item_id AND uii.action IN ('read', 'dismissed', 'saved')
-			WHERE uii.id IS NULL -- Exclude items already interacted with
-			GROUP BY ci.id
+				cit.topic_id,
+				SUM(
+					CASE 
+						WHEN uii.action = 'saved' THEN 2.0
+						WHEN uii.action = 'read' THEN 1.0
+						WHEN uii.action = 'dismissed' THEN -1.0
+						ELSE 0.0
+					END
+				) AS raw_feedback
+			FROM user_item_interactions uii
+			JOIN content_item_topics cit ON uii.content_item_id = cit.content_item_id
+			GROUP BY cit.topic_id
 		)
 		SELECT 
 			ci.id, ci.source_id, ci.title, ci.url, ci.content_type, ci.summary, ci.why_it_matters, ci.body, ci.author, ci.published_at, ci.ingested_at, ci.created_at, ci.updated_at,
-			(si.base_quality * 1.0 + si.max_interest * 2.0 + si.max_roadmap) * EXP(-0.1 * EXTRACT(EPOCH FROM (NOW() - COALESCE(ci.published_at, ci.ingested_at)))/86400) AS rank_score,
-			CASE 
-				WHEN si.max_roadmap >= 3.0 THEN 'Relevant to your current learning roadmap'
-				WHEN si.max_roadmap >= 2.0 THEN 'Relevant to your upcoming learning roadmap'
-				WHEN si.max_interest > 0.7 THEN 'Strongly matches your interests'
-				WHEN si.max_interest > 0 THEN 'Matches your interests'
-				ELSE 'Recent content from your sources'
-			END AS personalization_explanation
+			MAX(COALESCE(s.base_quality_score, 0.5)) AS base_quality,
+			MAX(COALESCE(i.weight * cit.relevance_score, 0)) AS max_interest,
+			MAX(CASE WHEN ro.status = 'current' THEN 2 WHEN ro.status = 'next' THEN 1 ELSE 0 END) AS roadmap_level,
+			EXTRACT(EPOCH FROM (NOW() - COALESCE(ci.published_at, ci.ingested_at)))/86400 AS days_since,
+			MAX(COALESCE(tf.raw_feedback, 0)) AS max_raw_feedback
 		FROM content_items ci
-		JOIN scored_items si ON ci.id = si.id
-		ORDER BY rank_score DESC
-		LIMIT $1
+		JOIN sources s ON ci.source_id = s.id
+		LEFT JOIN content_item_topics cit ON ci.id = cit.content_item_id
+		LEFT JOIN interests i ON cit.topic_id = i.topic_id
+		LEFT JOIN roadmap_items ro ON cit.topic_id = ro.topic_id
+		LEFT JOIN topic_feedback tf ON cit.topic_id = tf.topic_id
+		LEFT JOIN user_item_interactions uii_exclude ON ci.id = uii_exclude.content_item_id AND uii_exclude.action IN ('read', 'dismissed', 'saved')
+		WHERE uii_exclude.id IS NULL -- Exclude items already interacted with
+		GROUP BY ci.id
+		LIMIT 1000
 	`
 
-	rows, err := r.db.Query(ctx, query, limit)
+	rows, err := r.db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var items []ContentItem
+	rawItems := make(map[int64]ContentItem)
+	signals := make(map[int64]RankingSignals)
+
 	for rows.Next() {
 		var item ContentItem
-		// We have to scan the additional two fields (rank_score and personalization_explanation)
+		var sig RankingSignals
+
 		err := rows.Scan(
 			&item.ID,
 			&item.SourceID,
@@ -265,20 +287,25 @@ func (r *Repository) ListPersonalized(ctx context.Context, limit int) ([]Content
 			&item.IngestedAt,
 			&item.CreatedAt,
 			&item.UpdatedAt,
-			&item.RankScore,
-			&item.PersonalizationExplanation,
+			&sig.BaseQuality,
+			&sig.MaxInterest,
+			&sig.RoadmapLevel,
+			&sig.DaysSince,
+			&sig.MaxRawFeedback,
 		)
 		if err != nil {
 			return nil, err
 		}
-		items = append(items, item)
+
+		rawItems[item.ID] = item
+		signals[item.ID] = sig
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	return items, nil
+	return RankAndSortFeed(rawItems, signals, limit), nil
 }
 
 // RecordInteraction upserts a user action (read, saved, dismissed) on a ContentItem.
